@@ -80,6 +80,7 @@ class RequestTokenTracker:
         reporter: KVRouterReporter,
         request_id: str,
         prompt_token_ids: List[int],
+        expected_output_tokens: Optional[int],
         emits_deltas: bool,
     ):
         self._reporter = reporter
@@ -89,7 +90,11 @@ class RequestTokenTracker:
         self._prefill_marked = False
         self._finished = False
         reporter.report(
-            "on_request_added", request_id, reporter.worker_id, prompt_token_ids
+            "on_request_added",
+            request_id,
+            reporter.worker_id,
+            prompt_token_ids,
+            expected_output_tokens,
         )
 
     def on_output(self, output: RequestOutput) -> None:
@@ -149,6 +154,9 @@ def enable_token_tracking(engine_cls: Type[AsyncLLM]) -> Type[AsyncLLM]:
                 reporter,
                 request_id,
                 _prompt_token_ids(prompt),
+                # The request's own output cap is its expected length; weights
+                # the selection service's decode-block decay.
+                sampling_params.max_tokens,
                 emits_deltas=sampling_params.output_kind == RequestOutputKind.DELTA,
             )
             try:

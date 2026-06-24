@@ -50,6 +50,9 @@ class RequestLifecycle:
 
     worker_id: int
     prompt_tokens: int = 0
+    # Client-provided output-length estimate (``sampling_params.max_tokens``);
+    # weights each decode block's load by how much generation remains.
+    expected_output_tokens: Optional[int] = None
     prefill_completed: bool = False
     output_tokens: int = 0
     # Running count of KV blocks (prompt + output) the request occupies; the
@@ -83,6 +86,8 @@ class KVRouterActor:
        every replica's KV events; each node records which workers hold that KV block.
     5. Scoring (``select_worker``) ranks candidate workers by KV-cache overlap
        (queried from the KV index) plus prefill/decode load.
+    6. Books each request's lifecycle into the service's active-load tracker, so
+       in-flight load feeds back into scoring for subsequent requests.
     """
 
     def __init__(self, block_size: int):
@@ -302,26 +307,43 @@ class KVRouterActor:
         request_id: str,
         worker_id: int,
         token_ids: List[int],
+        expected_output_tokens: Optional[int] = None,
     ) -> None:
-        """Record a newly admitted request as active load on ``worker_id``."""
+        """Admit a routed request into ``worker_id``'s active load, booking it
+        into the selection service (which computes the worker's KV overlap from
+        ``token_ids``, so counted prefill excludes the cached prefix)."""
         prompt_tokens = len(token_ids)
         self._requests[request_id] = RequestLifecycle(
             worker_id=worker_id,
             prompt_tokens=prompt_tokens,
+            expected_output_tokens=expected_output_tokens,
             total_blocks=math.ceil(prompt_tokens / self._block_size),
+        )
+        await self._svc.create_reservation(
+            {
+                "model_name": _MODEL_NAME,
+                "tenant_id": _TENANT_ID,
+                "reservation_id": request_id,
+                "worker_id": worker_id,
+                "token_ids": token_ids,
+                "expected_output_tokens": expected_output_tokens,
+            }
         )
 
     async def on_prefill_complete(self, request_id: str) -> None:
-        """Mark that ``request_id`` completed prefill and is now decoding."""
+        """Record a request's prefill->decode transition, dropping its prefill
+        load in the selection service."""
         state = self._requests.get(request_id)
-        if state is not None:
-            state.prefill_completed = True
+        if state is None:
+            return
+        state.prefill_completed = True
+        await self._svc.prefill_complete(request_id)
 
     async def on_decode_progress(
         self, request_id: str, cumulative_output_tokens: int
     ) -> None:
         """Advance ``request_id`` to an exact cumulative output-token count,
-        adding any newly crossed decode blocks to its accounted load.
+        booking one decode block in the selection service per crossed boundary.
         """
         state = self._requests.get(request_id)
         if state is None:
@@ -330,12 +352,24 @@ class KVRouterActor:
         new_total_blocks = math.ceil(
             (state.prompt_tokens + cumulative_output_tokens) / self._block_size
         )
+        decay_fraction = self._decay_fraction(state)
         while new_total_blocks > state.total_blocks:
             state.total_blocks += 1
+            self._svc.add_output_block(request_id, decay_fraction=decay_fraction)
 
     async def on_request_completed(self, request_id: str) -> None:
-        """Evict ``request_id``; it no longer counts as active load."""
-        self._requests.pop(request_id, None)
+        """Free ``request_id`` from the selection service's active load and the
+        local view."""
+        if self._requests.pop(request_id, None) is not None:
+            await self._svc.free_reservation(request_id)
+
+    def _decay_fraction(self, state: RequestLifecycle) -> Optional[float]:
+        """Fraction of output still expected, or ``None`` without an estimate;
+        weights each decode block by how much generation remains, mirroring the
+        selection service's ``OutputBlockTracker`` decay (1 - osl/expected)."""
+        if not state.expected_output_tokens:
+            return None
+        return max(0.0, 1.0 - state.output_tokens / state.expected_output_tokens)
 
     async def get_request_lifecycle(self, request_id: str) -> Optional[Dict[str, Any]]:
         """Return a snapshot of an in-flight request's state, or ``None``."""

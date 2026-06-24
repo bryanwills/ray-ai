@@ -190,6 +190,20 @@ async def wait_for_overlap(actor, token_ids, predicate, publish=None, timeout=30
     await async_wait_for_condition(condition, timeout=timeout, retry_interval_ms=500)
 
 
+async def book_uncached_load(actor, worker_id, count, base):
+    """Book ``count`` reservations of distinct, uncached tokens onto ``worker_id``
+    so each adds full prefill load to it; returns their reservation ids."""
+    reservation_ids = []
+    for i in range(count):
+        reservation_id = f"load-{base}-{i}"
+        start = base + i * 4 * BLOCK_SIZE
+        await actor.on_request_added.remote(
+            reservation_id, worker_id, list(range(start, start + 4 * BLOCK_SIZE))
+        )
+        reservation_ids.append(reservation_id)
+    return reservation_ids
+
+
 class TestKvEventIngestion:
     """Validates that a replica advertises its vLLM ZMQ PUB endpoint on the
     LongPoll snapshot -> the KVRouterActor registers it -> the selection
@@ -354,6 +368,72 @@ class TestKvEventIngestion:
             )
             assert selection["worker_id"] == worker_a
             assert selection["overlap_tokens"] >= BLOCK_SIZE
+        finally:
+            await a.close.remote()
+            await b.close.remote()
+            for x in (a, b, actor):
+                ray.kill(x, no_restart=True)
+
+    @pytest.mark.asyncio
+    async def test_select_worker_prefers_lower_load(self, ray_instance):
+        """With equal KV overlap on both workers, select_worker routes to the
+        worker carrying less active load. Booking heavy load onto one worker
+        sends the next equally-overlapping request to the other; moving the load
+        flips the choice back, proving load -- not a fixed tie-break -- routes."""
+        actor = LocalKVRouterActor.remote(block_size=BLOCK_SIZE)
+        a = FakeReplica.remote(23907)
+        b = FakeReplica.remote(23908)
+        worker_a = get_worker_id("replica-A")
+        worker_b = get_worker_id("replica-B")
+        try:
+            await actor._on_deployment_targets.remote(
+                targets(
+                    running_replica(
+                        "replica-A",
+                        await a.endpoint.remote(),
+                        await a.replay_endpoint.remote(),
+                    ),
+                    running_replica(
+                        "replica-B",
+                        await b.endpoint.remote(),
+                        await b.replay_endpoint.remote(),
+                    ),
+                )
+            )
+            await wait_registered(actor, [worker_a, worker_b])
+
+            # Both replicas cache the same prompt blocks: overlap is equal, so the
+            # selection turns purely on each worker's active load.
+            token_ids = list(range(2 * BLOCK_SIZE))
+            await wait_for_overlap(
+                actor,
+                token_ids,
+                lambda overlap: overlap.get(worker_a) == 2,
+                publish=lambda: a.publish_stored.remote([601, 602], token_ids),
+            )
+            await wait_for_overlap(
+                actor,
+                token_ids,
+                lambda overlap: overlap.get(worker_b) == 2,
+                publish=lambda: b.publish_stored.remote([601, 602], token_ids),
+            )
+
+            # Heavy active load on A (uncached prompts -> full prefill load): the
+            # equally-overlapping request is routed to the idle worker B.
+            load_a = await book_uncached_load(actor, worker_a, count=8, base=100_000)
+            selection = await actor.select_worker.remote(
+                "probe-1", token_ids, [worker_a, worker_b]
+            )
+            assert selection["worker_id"] == worker_b
+
+            # Free A and load B instead: the choice flips to A.
+            for reservation_id in load_a:
+                await actor.on_request_completed.remote(reservation_id)
+            await book_uncached_load(actor, worker_b, count=8, base=500_000)
+            selection = await actor.select_worker.remote(
+                "probe-2", token_ids, [worker_a, worker_b]
+            )
+            assert selection["worker_id"] == worker_a
         finally:
             await a.close.remote()
             await b.close.remote()

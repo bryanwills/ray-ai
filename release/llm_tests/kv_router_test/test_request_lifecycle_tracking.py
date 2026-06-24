@@ -1,13 +1,16 @@
-"""GPU end-to-end test for KV-router request-lifecycle tracking.
+"""GPU end-to-end test for KV-router request-lifecycle active-load tracking.
 
-Deploys a direct-streaming LLM app on a real vLLM engine, with a recording
-subclass of the deployment-scoped ``KVRouterActor`` attached, streams a real
-chat completion, and asserts the lifecycle hooks fired in order with token
-counts exactly matching the engine's reported usage.
+Deploys a direct-streaming LLM app on a real vLLM engine with KV events enabled
+and a recording subclass of the deployment-scoped ``KVRouterActor`` attached,
+streams a real chat completion, and asserts that the lifecycle hooks fire in
+order with token/block counts matching the engine's usage, that each hook's call
+into the live selection service succeeds, that the request is booked as active
+load while in flight and released on completion (the load tracker is scoring's
+input), and that the prompt's KV blocks are indexed as cache overlap.
 
-``KVAwareRouter`` replica selection lands in a later branch, so the actor is
-attached directly via ``deployment_actors`` and requests route with the
-default router; the engine-client token tracking is router-independent.
+``KVAwareRouter`` replica selection is exercised by its own tests; here the actor
+is attached directly via ``deployment_actors`` and requests route with the
+default router, so token tracking is verified independent of routing.
 """
 
 import asyncio
@@ -19,6 +22,7 @@ import tempfile
 
 import pytest
 import requests
+from dynamo.llm import compute_block_hash_for_seq
 
 # Direct ingress gives each replica its own backend HTTP server so the test
 # can hit the replica's vLLM ASGI app directly.
@@ -27,14 +31,18 @@ os.environ["RAY_SERVE_ENABLE_DIRECT_INGRESS"] = "1"
 
 import ray  # noqa: E402
 from ray import serve  # noqa: E402
+from ray._common.test_utils import async_wait_for_condition  # noqa: E402
 from ray.llm._internal.serve.core.ingress.builder import (  # noqa: E402
     _build_direct_streaming_llm_deployment,
 )
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_actor import (  # noqa: E402
+    _MODEL_NAME,
+    _TENANT_ID,
     KV_ROUTER_ACTOR_NAME,
     KVRouterActor,
 )
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_events import (  # noqa: E402
+    configure_kv_events_for_kv_routing,
     derive_kv_event_block_size,
 )
 from ray.serve._private.constants import (  # noqa: E402
@@ -47,6 +55,7 @@ from ray.serve.llm import LLMConfig, ModelLoadingConfig  # noqa: E402
 MODEL_ID = "Qwen/Qwen3-0.6B"
 APP_NAME = "lifecycle_tracking_gpu_test"
 REQUEST_ID = "gpu-req-1"
+BLOCK_SIZE = 16
 MAX_TOKENS = 48
 # A multi-block prompt so the engine caches retrievable KV blocks.
 PROMPT_TEXT = (
@@ -62,22 +71,59 @@ ENGINE_REQUEST_ID = f"chatcmpl-{REQUEST_ID}"
 
 @ray.remote(num_cpus=0)
 class RecordingKVRouterActor(KVRouterActor):
-    """The real KVRouterActor, additionally recording every event it applies.
+    """The real KVRouterActor, additionally recording every event it applies
+    and any error raised while booking it into the live selection service.
 
     Eviction on completion makes the hook calls unobservable from state alone;
-    the event log preserves them for assertion.
+    the event log preserves them, and the error log proves each hook's call into
+    the live service succeeded rather than being swallowed by the reporter pump.
     """
 
     def __init__(self, block_size):
         super().__init__(block_size=block_size)
         self._event_log = []
+        self._errors = []
 
     async def on_lifecycle_events(self, events):
         self._event_log.extend(events)
-        await super().on_lifecycle_events(events)
+        for event in events:
+            try:
+                await super().on_lifecycle_events([event])
+            except Exception as e:  # noqa: BLE001
+                self._errors.append((event[0], repr(e)))
 
     def get_event_log(self):
         return self._event_log
+
+    def get_errors(self):
+        return self._errors
+
+    def get_registered_worker_ids(self):
+        """(Test only) Worker ids the selection service can currently schedule."""
+        workers = self._svc.list_workers(model_name=_MODEL_NAME, tenant_id=_TENANT_ID)
+        return sorted(
+            w["worker_id"] for w in workers if w["lifecycle"] == "schedulable"
+        )
+
+    async def get_worker_active_requests(self, worker_id):
+        """(Test only) In-flight requests the service tracks as active load on
+        ``worker_id`` -- the count scoring factors in."""
+        for model in self._svc.loads(model_name=_MODEL_NAME, tenant_id=_TENANT_ID):
+            for load in model["loads"]:
+                if load["worker_id"] == worker_id:
+                    return load["active_requests"]
+        return 0
+
+    async def get_overlap_blocks(self, token_ids):
+        """(Test only) Per-worker device-tier KV overlap blocks for a sequence."""
+        scores = await self._svc.overlap_scores(
+            {
+                "model_name": _MODEL_NAME,
+                "tenant_id": _TENANT_ID,
+                "token_ids": list(token_ids),
+            }
+        )
+        return {w["worker_id"]: w["device_blocks"] for w in scores["workers"]}
 
 
 def discover_deployment_actor(app_name, deployment_name, actor_name):
@@ -100,10 +146,16 @@ def discover_deployment_actor(app_name, deployment_name, actor_name):
     return None
 
 
+def num_prompt_blocks(token_ids):
+    """Number of full KV blocks in a token sequence (matches the indexer)."""
+    return len(compute_block_hash_for_seq(list(token_ids), BLOCK_SIZE))
+
+
 class TestLifecycleTrackingGPU:
     @pytest.fixture(scope="class")
     def deployed_handle(self):
-        """Deploy a direct-streaming LLMServer with the recording actor."""
+        """Deploy a direct-streaming LLMServer with KV events on and the
+        recording actor attached."""
         if not ray.is_initialized():
             # An empty working_dir keeps the runtime-env package tiny; the
             # repo root would exceed the upload size limit.
@@ -149,6 +201,10 @@ class TestLifecycleTrackingGPU:
             ),
             log_engine_metrics=False,
         )
+        # Emit engine KV-cache events so the actor registers the replica's worker
+        # (making it schedulable, required to book a reservation) and the service
+        # indexes the prompt's blocks.
+        configure_kv_events_for_kv_routing(llm_config)
 
         app = _build_direct_streaming_llm_deployment(llm_config)
         handle = serve.run(app, name=APP_NAME)
@@ -166,16 +222,28 @@ class TestLifecycleTrackingGPU:
             await asyncio.sleep(1.0)
         raise AssertionError("replica backend HTTP endpoint never became available")
 
+    async def _registered_worker(self, actor):
+        """Wait for the replica's worker to register (schedulable) and return it."""
+        await async_wait_for_condition(
+            lambda: len(ray.get(actor.get_registered_worker_ids.remote())) == 1,
+            timeout=90,
+            retry_interval_ms=1000,
+        )
+        return (await actor.get_registered_worker_ids.remote())[0]
+
     @pytest.mark.asyncio
     async def test_exact_lifecycle_tracking(self, deployed_handle):
         actor = discover_deployment_actor(
             APP_NAME, deployed_handle.deployment_name, KV_ROUTER_ACTOR_NAME
         )
         assert actor is not None, "KV router actor was not discoverable"
+        host, port = await self._backend_endpoint(deployed_handle)
+        # The replica's worker must register before a request can book against it.
+        worker_id = await self._registered_worker(actor)
+        assert await actor.get_worker_active_requests.remote(worker_id) == 0
 
         # X-Request-Id pins the engine request id; include_usage returns the
         # engine's own token counts as ground truth.
-        host, port = await self._backend_endpoint(deployed_handle)
         url = f"http://{host}:{port}/v1/chat/completions"
         payload = {
             "model": MODEL_ID,
@@ -187,10 +255,12 @@ class TestLifecycleTrackingGPU:
         }
         headers = {"X-Request-Id": REQUEST_ID}
 
-        # Snapshot the actor's view after every streamed chunk: completion
-        # evicts the request, so state is only observable while streaming.
+        # Snapshot the actor's view and the worker's tracked load after every
+        # streamed chunk: completion evicts the request, so its in-flight state
+        # is only observable while streaming.
         usage = None
         snapshots = []
+        live_active_requests = []
         with requests.post(
             url, json=payload, headers=headers, stream=True, timeout=120
         ) as resp:
@@ -210,6 +280,9 @@ class TestLifecycleTrackingGPU:
                 snapshot = await actor.get_request_lifecycle.remote(ENGINE_REQUEST_ID)
                 if snapshot is not None:
                     snapshots.append(snapshot)
+                live_active_requests.append(
+                    await actor.get_worker_active_requests.remote(worker_id)
+                )
 
         assert usage is not None, "expected a final usage chunk"
         assert snapshots, "request was never observed in flight on the actor"
@@ -229,17 +302,26 @@ class TestLifecycleTrackingGPU:
             if snapshot["output_tokens"] > 0:
                 assert snapshot["prefill_completed"] is True
 
-        # The worker id load was attributed to, asserted against the event log below.
-        worker_id = snapshots[-1]["worker_id"]
+        # The request was booked as active load on its worker while in flight,
+        # and every hook's call into the live selection service succeeded.
+        assert max(live_active_requests) >= 1, "request was never booked as active load"
+        assert await actor.get_errors.remote() == []
 
-        # Completion evicts the request from the actor's active-load view.
-        for _ in range(50):
-            lifecycle = await actor.get_request_lifecycle.remote(ENGINE_REQUEST_ID)
-            if lifecycle is None:
-                break
-            await asyncio.sleep(0.2)
-        assert lifecycle is None, "completed request was not evicted"
+        # Completion frees the request from both the actor view and the load
+        # tracker (no leaked active load to skew later scoring).
+        worker_id = snapshots[-1]["worker_id"]
+        await async_wait_for_condition(
+            lambda: ray.get(actor.get_request_lifecycle.remote(ENGINE_REQUEST_ID))
+            is None,
+            timeout=15,
+            retry_interval_ms=200,
+        )
         assert await actor.get_active_request_ids.remote() == []
+        await async_wait_for_condition(
+            lambda: ray.get(actor.get_worker_active_requests.remote(worker_id)) == 0,
+            timeout=15,
+            retry_interval_ms=200,
+        )
 
         events = [
             (name, args)
@@ -254,12 +336,50 @@ class TestLifecycleTrackingGPU:
 
         added_args = events[0][1]
         assert added_args[1] == worker_id
-        assert len(added_args[2]) == usage["prompt_tokens"]  # token ids booked
+        prompt_token_ids = added_args[2]
+        assert len(prompt_token_ids) == usage["prompt_tokens"]  # token ids booked
+        assert added_args[3] == MAX_TOKENS  # client max_tokens drives decode decay
         decode_counts = [
             args[1] for name, args in events if name == "on_decode_progress"
         ]
         assert decode_counts == sorted(set(decode_counts))  # strictly increasing
         assert decode_counts[-1] == usage["completion_tokens"]
+
+        # The engine indexed the prompt's KV blocks; they show as cache overlap
+        # on the worker (the prefix the next overlapping request would reuse).
+        prompt_blocks = num_prompt_blocks(prompt_token_ids)
+        assert prompt_blocks >= 1
+        await async_wait_for_condition(
+            lambda: ray.get(actor.get_overlap_blocks.remote(prompt_token_ids)).get(
+                worker_id, 0
+            )
+            == prompt_blocks,
+            timeout=60,
+            retry_interval_ms=500,
+        )
+
+    @pytest.mark.asyncio
+    async def test_booked_reservation_changes_scoring_load(self, deployed_handle):
+        """A reservation booked through the lifecycle hooks shows up as active
+        load on the worker (the value scoring consumes) and freeing it restores
+        baseline -- deterministic, without racing a live stream."""
+        actor = discover_deployment_actor(
+            APP_NAME, deployed_handle.deployment_name, KV_ROUTER_ACTOR_NAME
+        )
+        worker_id = await self._registered_worker(actor)
+        assert await actor.get_worker_active_requests.remote(worker_id) == 0
+
+        await actor.on_request_added.remote(
+            "probe", worker_id, list(range(64)), expected_output_tokens=32
+        )
+        assert await actor.get_worker_active_requests.remote(worker_id) == 1
+
+        await actor.on_request_completed.remote("probe")
+        await async_wait_for_condition(
+            lambda: ray.get(actor.get_worker_active_requests.remote(worker_id)) == 0,
+            timeout=15,
+            retry_interval_ms=200,
+        )
 
 
 if __name__ == "__main__":
